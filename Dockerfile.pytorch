@@ -1,0 +1,186 @@
+
+FROM ubuntu:18.04
+
+RUN set -x \
+  && apt-get update \
+  && apt-get install \
+    -y \
+    --no-install-recommends \
+    --no-install-suggests \
+    ca-certificates \
+    gnupg \
+    git \
+    curl \
+    wget
+
+RUN set -x \
+  && cd /tmp/ \
+  && wget https://repo.anaconda.com/archive/Anaconda3-2020.07-Linux-x86_64.sh \
+  && bash ./Anaconda3-2020.07-Linux-x86_64.sh -b
+
+RUN set -x \
+  && /root/anaconda3/bin/conda install \
+    numpy ninja pyyaml mkl mkl-include setuptools cmake cffi typing_extensions future six requests dataclasses
+
+RUN set -x \
+  && curl -sL http://repo.radeon.com/rocm/rocm.gpg.key | apt-key add - \
+  && echo 'deb [arch=amd64] http://repo.radeon.com/rocm/apt/debian/ xenial main' | tee /etc/apt/sources.list.d/rocm.list \
+  && apt-get update \
+  && apt-get install -y \
+    gfortran \
+    libmsgpackc2 libmsgpack-dev \
+    hipcub \
+    hipsparse \
+    libnuma-dev \
+    miopen-hip \
+    rccl \
+    rocfft \
+    rocm-dkms \
+    rocprim \
+    rocthrust
+
+ENV rocm_path=/opt/rocm/bin:/opt/rocm/hip/bin:/opt/rocm/llvm/bin:/opt/rocm/miopen/bin:/opt/rocm/opencl/bin:/opt/rocm/rocprofiler/bin
+ENV anaconda_path=/root/anaconda3/bin
+
+ENV PATH=${rocm_path}:${anaconda_path}:${PATH}
+ENV CMAKE_PREFIX_PATH="/opt/rocm:/opt/rocm/hip:/root/anaconda3"
+ENV CPATH="/root/anaconda3/include:${CPATH}"
+
+ENV HIP_PLATFORM=hcc
+
+ENV AMDGPU_TARGETS=gfx803
+ENV GLOO_ROCM_ARCH=${AMDGPU_TARGETS}
+ENV HCC_AMD_GPU_TARGET=${AMDGPU_TARGETS}
+ENV PYTORCH_ROCM_ARCH=${AMDGPU_TARGETS}
+
+RUN set -x \
+  && git clone -b rocm-3.8.0 https://github.com/ROCmSoftwarePlatform/rocRAND.git /opt/rocRAND
+
+RUN set -x \
+  && export CPU=$(grep -c processor /proc/cpuinfo) \
+  && mkdir /opt/rocRAND/build \
+  && cd /opt/rocRAND/build \
+  && CXX=hipcc cmake \
+    -DAMDGPU_TARGETS=${AMDGPU_TARGETS} \
+    -DBUILD_BENCHMARK=ON .. \
+  && make -j${CPU} \
+  && make install
+
+ENV LD_LIBRARY_PATH=/opt/rocm/rocrand/lib:/opt/rocm/lib:${LD_LIBRARY_PATH}
+
+RUN set -x \
+  && git clone --recursive -b clang_tot_upgrade https://github.com/RadeonOpenCompute/hcc.git /opt/hcc
+
+RUN set -x \
+  && export CPU=$(grep -c processor /proc/cpuinfo) \
+  && mkdir /opt/hcc/build \
+  && cd /opt/hcc/build \
+  && export CMAKE_C_FLAGS=-fPIC \
+  && export CMAKE_CXX_FLAGS=-fPIC \
+  && cmake -DCMAKE_BUILD_TYPE=Release .. \
+  && make -j${CPU} \
+  && make install
+
+RUN set -x \
+  && git clone -b rocm-3.8.0 https://github.com/RadeonOpenCompute/llvm-project.git /opt/llvm-project \
+  && mkdir /opt/llvm-project/build
+
+RUN set -x \
+  && cd /opt/llvm-project/build \
+  && cmake \
+    -DCMAKE_INSTALL_PREFIX=/opt/rocm/llvm \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLVM_ENABLE_ASSERTIONS=1 \
+    -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86" \
+    -DLLVM_ENABLE_PROJECTS="clang;lld;compiler-rt" \
+    ../llvm \
+  && make -j6 \
+  && make install
+
+RUN set -x \
+  && git clone -b rocm-3.8.0 https://github.com/RadeonOpenCompute/ROCm-Device-Libs.git /opt/ROCm-Device-Libs \
+  && mkdir -p /opt/ROCm-Device-Libs/build
+
+RUN set -x \
+  && cd /opt/ROCm-Device-Libs/build \
+  && CC=clang CXX=clang++ \
+    cmake \
+      -DLLVM_DIR=/opt/rocm/llvm \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DLLVM_ENABLE_WERROR=1 \
+      -DLLVM_ENABLE_ASSERTIONS=1 \
+      -DCMAKE_INSTALL_PREFIX=/opt/rocm .. \
+  && make -j \
+  && make install
+
+RUN set -x \
+  && git clone -b rocm-3.8.0 https://github.com/ROCmSoftwarePlatform/rocBLAS.git /opt/rocBLAS
+
+RUN set -x \
+  && cd /opt/rocBLAS \
+  && ./install.sh -i
+
+RUN set -x \
+  && git clone -b rocm-3.8.0 https://github.com/ROCm-Developer-Tools/ROCclr.git /opt/ROCclr \
+  && mkdir -p /opt/ROCclr/build
+
+RUN set -x \
+  && git clone -b rocm-3.8.0 https://github.com/RadeonOpenCompute/ROCm-OpenCL-Runtime.git /opt/ROCm-OpenCL-Runtime \
+  && mkdir -p /opt/ROCm-OpenCL-Runtime
+
+RUN set -x \
+  && cd /opt/ROCclr/build \
+  && cmake \
+    -DOPENCL_DIR="/opt/ROCm-OpenCL-Runtime" \
+    -DCMAKE_INSTALL_PREFIX=/opt/rocm/rocclr \
+    .. \
+  && make -j \
+  && make install
+
+RUN set -x \
+  && git clone -b rocm-3.8.0 https://github.com/ROCm-Developer-Tools/HIP.git /opt/HIP \
+  && mkdir -p /opt/HIP/build
+
+RUN set -x \
+  && mv /opt/rocm/hip /opt/rocm/hip.orig \
+  && cd /opt/HIP/build \
+  && echo '### gfx803 hack ###' \
+  && sed -i 's,AMDGPU_TARGETS "[^""]\+",AMDGPU_TARGETS "gfx803",' ../hip-config.cmake.in \
+  && echo '### hack end ###' \
+  && cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DHIP_COMPILER=clang \
+  -DHIP_PLATFORM=rocclr \
+  -DCMAKE_PREFIX_PATH="/opt/ROCclr/build;/opt/rocm/" \
+  -DCMAKE_INSTALL_PREFIX="/opt/rocm/hip" \
+  .. \
+  && make -j \
+  && make install
+
+ENV LD_LIBRARY_PATH=/opt/rocm/hip/lib:${LD_LIBRARY_PATH}
+
+RUN set -x \
+  && git clone -b v1.6.0 --recursive https://github.com/pytorch/pytorch /opt/pytorch \
+  && cd /opt/pytorch \
+  && git submodule init \
+  && git submodule update --init --recursive
+
+RUN set -x \
+  && export USE_ROCM=1 \
+  && cd /opt/pytorch \
+  && echo '### 1.6.0 hacks ###' \
+  && sed -i '1 i\set(GLOO_HIP_HCC_LIBRARIES "/opt/rocm/hip/lib/libamdhip64.so.3")' CMakeLists.txt \
+  && sed -i '1 i\set(PYTORCH_HIP_HCC_LIBRARIES "/opt/rocm/hip/lib/libamdhip64.so.3")' CMakeLists.txt \
+  && sed -i '1 i\set(ROCM_HIPRTC_LIB "/opt/rocm/hip/lib/libamdhip64.so.3")' CMakeLists.txt \
+  && echo '### hacks end ###' \
+  && echo '### fastai dependencies hacks ###' \
+  && echo 1.6.0 > version.txt \
+  && echo '### hacks end ###' \
+  && python tools/amd_build/build_amd.py \
+  && python setup.py install \
+  && python setup.py bdist_wheel
+
+RUN set -x \
+  && cd /opt/pytorch \
+  && pip install fastai
+
